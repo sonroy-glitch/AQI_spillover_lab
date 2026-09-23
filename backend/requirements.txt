@@ -1,0 +1,12 @@
+flask>=3.0
+flask-cors>=4.0
+requests>=2.31
+numpy>=1.26
+pandas>=2.0
+# Pinned: the pickles in models/ were saved from scikit-learn 1.9.0 and 1.6.1.
+# A different version still unpickles but warns, and is not guaranteed to be
+# numerically identical, so the image should build on a known one.
+scikit-learn==1.9.0
+python-dotenv>=1.0
+groq>=1.0
+gunicorn>=23.0

@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.py[cod]
+
+# 880MB of pickles — over GitHub's 100MB per-file limit. Ship them via Git LFS,
+# a prebuilt image, or AQI_MODEL_BASE_URL (see README).
+

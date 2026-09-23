@@ -1,0 +1,14 @@
+# Secrets never belong in an image — set them as Northflank env/secrets instead.
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
+.venv/
+venv/
+README.md
+Dockerfile
+.dockerignore
