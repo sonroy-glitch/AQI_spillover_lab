@@ -172,7 +172,8 @@ Notes on what's in it:
 - `scikit-learn` is **pinned to 1.9.0** in `requirements.txt` because the pickles were
   saved from 1.9.0 and 1.6.1. Another version still unpickles, but only with warnings.
 - `app.py` is copied before `models/` so code changes don't rebuild the ~880MB layer.
-  The finished image is roughly **1.5GB** — that is the models, not the runtime.
+  The finished image is **~2.9GB** (measured) — mostly the models and the
+  numpy/pandas/sklearn stack, not application code.
 - Runs as a non-root user, and `.dockerignore` keeps `.env` out of the image.
 - `CMD` is gunicorn with **one worker** and 8 threads. Each worker holds its own copy
   of the forests, so a second worker doubles the memory for no throughput gain.
@@ -226,6 +227,58 @@ is gitignored. Pick one:
    Dockerfile), then deploy that image on Northflank instead of building from source.
 3. **Git LFS** — works, but you pay LFS bandwidth on every build.
 4. **`AQI_USE_MODELS=0`** — no models at all; horizons come from Open-Meteo's forecast.
+
+### "invalid load key, 'v'" — the models are LFS pointers
+
+```
+WARNING in app: could not load ./models/model_24.pkl: invalid load key, 'v'
+INFO  in app: model warmup finished in 0.0s
+```
+
+`backend/models/*.pkl` is tracked with Git LFS, so a clone that never ran `git lfs pull`
+gets ~130-byte text files starting with `version https://git-lfs.github.com/spec/v1` —
+the `'v'` pickle trips over. Warmup finishing in 0.0s is the other tell.
+
+The server now detects this and says so, and `/api/health` reports it per file:
+
+```json
+"modelFiles": { "6": "lfs-pointer (run `git lfs pull` or set AQI_MODEL_BASE_URL)" }
+```
+
+The app keeps serving — those horizons fall back to Open-Meteo's forecast, which
+`meta.modelByHorizon` shows — but the trained models are not in play.
+
+**Fix: the models are published as a GitHub Release**, and the backend fetches them on
+first use. The release was created from this repo:
+
+<https://github.com/sonroy-glitch/AQI_spillover_lab/releases/tag/models-v1>
+
+Set this in Northflank (Environment → add variable) and redeploy:
+
+```
+AQI_MODEL_BASE_URL = https://github.com/sonroy-glitch/AQI_spillover_lab/releases/download/models-v1
+```
+
+The server then replaces each LFS pointer with the real file on first use. **Add a
+persistent volume mounted at `/app/models` (≥2GB)** or every restart re-downloads 849MB
+— expect a slow first boot either way; `/api/health` shows `modelFiles` turning from
+`lfs-pointer` to `ok (571MB)` as they land.
+
+To refresh the models later, upload to the same tag and restart with an empty volume:
+
+```bash
+gh release upload models-v1 backend/models/*.pkl \
+  --repo sonroy-glitch/AQI_spillover_lab --clobber
+```
+
+Note the repo is public, so these assets are publicly downloadable. Move them to a
+private bucket (any HTTP host works) if that is not acceptable.
+
+Alternatives: build the image locally where the real files exist and push it to a
+registry, deploying that image instead of building from source; or run with
+`AQI_USE_MODELS=0` and accept Open-Meteo's horizons. Whether Northflank's builder can
+run `git lfs pull` itself is not something I could confirm — check with their support
+if you'd rather keep the files in the repo.
 
 ### Things that bite
 

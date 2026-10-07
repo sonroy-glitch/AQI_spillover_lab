@@ -156,6 +156,22 @@ _models: Dict[int, Any] = {}
 _model_lock = threading.Lock()
 
 
+# A Git LFS pointer is a ~130 byte text file starting with this line. Cloning a repo
+# without `git lfs pull` leaves these in place of the real pickles, and pickle.load
+# then fails with the cryptic "invalid load key, 'v'".
+LFS_POINTER_PREFIX = b"version https://git-lfs"
+
+
+def is_lfs_pointer(path: str) -> bool:
+    try:
+        if os.path.getsize(path) > 4096:
+            return False
+        with open(path, "rb") as fh:
+            return fh.read(len(LFS_POINTER_PREFIX)) == LFS_POINTER_PREFIX
+    except OSError:
+        return False
+
+
 def download_model(horizon: int, dest: str) -> None:
     """Stream models/model_<h>.pkl from AQI_MODEL_BASE_URL into MODEL_DIR."""
     url = f"{MODEL_BASE_URL}/model_{horizon}.pkl"
@@ -186,8 +202,19 @@ def get_model(horizon: int):
         if horizon in _models:
             return _models[horizon]
         path = os.path.join(MODEL_DIR, f"model_{horizon}.pkl")
-        if not os.path.exists(path) and MODEL_BASE_URL:
-            download_model(horizon, path)
+
+        # An LFS pointer is worse than a missing file: it exists, so a plain
+        # existence check would skip the download and pickle would fail instead.
+        pointer = os.path.exists(path) and is_lfs_pointer(path)
+        if pointer:
+            app.logger.warning(
+                "%s is a Git LFS pointer, not the model itself — the checkout never ran "
+                "`git lfs pull`. Set AQI_MODEL_BASE_URL to fetch it over HTTP, bake the "
+                "real files into the image, or enable LFS in the build.", path)
+
+        if (pointer or not os.path.exists(path)) and MODEL_BASE_URL:
+            download_model(horizon, path)  # os.replace overwrites the pointer
+
         model = None
         try:
             with open(path, "rb") as fh:
@@ -884,6 +911,14 @@ def parse_coords(args) -> Optional[Tuple[float, float]]:
 # Routes
 # --------------------------------------------------------------------------------------
 
+def _model_file_state(path: str) -> str:
+    if not os.path.exists(path):
+        return "missing"
+    if is_lfs_pointer(path):
+        return "lfs-pointer (run `git lfs pull` or set AQI_MODEL_BASE_URL)"
+    return f"ok ({os.path.getsize(path) // 1048576}MB)"
+
+
 @app.get("/api/health")
 def health():
     return jsonify({
@@ -898,6 +933,11 @@ def health():
         },
         "modelsEnabled": USE_MODELS,
         "modelsLoaded": sorted(h for h, m in _models.items() if m is not None),
+        "modelDir": MODEL_DIR,
+        "modelFiles": {
+            str(h): _model_file_state(os.path.join(MODEL_DIR, f"model_{h}.pkl"))
+            for h in HORIZONS[1:]
+        },
         "overpassEnabled": USE_OVERPASS,
         "cachedKeys": len(_cache),
     })
