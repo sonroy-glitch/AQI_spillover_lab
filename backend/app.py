@@ -64,20 +64,42 @@ def _default_model_dir() -> str:
     return os.path.join(HERE, "models")
 
 
-MODEL_DIR = os.environ.get("AQI_MODEL_DIR") or _default_model_dir()
+def env_str(name: str, default: str = "") -> str:
+    """
+    Read an env var, tolerating values pasted from a .env file. A dashboard stores
+    AQI_USE_MODELS="0" literally, quotes included, where dotenv would have stripped
+    them — and `'"0"' != "0"` silently turns the flag back on.
+    """
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1].strip()
+    return value
+
+
+def env_flag(name: str, default: bool = True) -> bool:
+    value = env_str(name, "").lower()
+    if not value:
+        return default
+    return value not in ("0", "false", "no", "off")
+
+
+MODEL_DIR = env_str("AQI_MODEL_DIR") or _default_model_dir()
 # model_12.pkl (149MB) and model_24.pkl (571MB) exceed GitHub's 100MB file limit, so a
 # deployment that builds from a plain git repo has no models baked in. Point this at a
 # bucket/release holding model_<h>.pkl and they are fetched on first use instead.
-MODEL_BASE_URL = os.environ.get("AQI_MODEL_BASE_URL", "").rstrip("/")
-USE_MODELS = os.environ.get("AQI_USE_MODELS", "1") != "0"
-WARM_MODELS = os.environ.get("AQI_WARM_MODELS", "1") != "0"   # preload at boot
+MODEL_BASE_URL = env_str("AQI_MODEL_BASE_URL").rstrip("/")
+USE_MODELS = env_flag("AQI_USE_MODELS", True)
+WARM_MODELS = env_flag("AQI_WARM_MODELS", True)                # preload at boot
 TREE_SAMPLE = int(os.environ.get("AQI_TREE_SAMPLE", "150"))   # trees polled for the band
 # Which horizons to load at all. model_24.pkl alone unpickles to ~500MB, so on a small
 # plan "6,12,18" keeps the other three and lets +24h fall back to Open-Meteo.
 ENABLED_HORIZONS = {
     int(h) for h in os.environ.get("AQI_MODEL_HORIZONS", "6,12,18,24").split(",") if h.strip()
 }
-USE_OVERPASS = os.environ.get("AQI_USE_OVERPASS", "1") != "0"
+USE_OVERPASS = env_flag("AQI_USE_OVERPASS", True)
 
 # Chat: the groq client appends "/openai/v1" itself, so GROQ_BASE_URL is the bare
 # host. Pasting the full OpenAI-compatible URL is the obvious mistake, so trim it.
@@ -99,7 +121,7 @@ OVERPASS_URLS = [u for u in os.environ.get(
 ).split(",") if u.strip()]
 # Optional: a free token from aqicn.org/data-platform/token adds real monitoring
 # stations on top of the modelled field. Everything works without it.
-WAQI_TOKEN = os.environ.get("WAQI_TOKEN", "").strip()
+WAQI_TOKEN = env_str("WAQI_TOKEN")
 USER_AGENT = "AeroCast-Dashboard/1.0 (air-quality forecast demo)"
 
 FORECAST_TTL = int(os.environ.get("AQI_CACHE_TTL", "600"))     # live conditions: 10 min
@@ -929,6 +951,23 @@ def _model_file_state(path: str) -> str:
     return f"ok ({os.path.getsize(path) // 1048576}MB)"
 
 
+@app.get("/")
+def root():
+    """
+    A platform health check that has not been pointed at /api/health probes "/" by
+    default, and a 404 there is enough to put the container in a restart loop. This
+    also doubles as a human-readable landing page for the service URL.
+    """
+    return jsonify({
+        "service": "aerocast-backend",
+        "status": "ok",
+        "routes": ["/api/health", "/api/cities", "/api/forecast", "/api/search",
+                   "/api/geocode", "/api/chat"],
+    })
+
+
+@app.get("/health")
+@app.get("/healthz")
 @app.get("/api/health")
 def health():
     return jsonify({
@@ -1075,7 +1114,7 @@ _groq_lock = threading.Lock()
 def get_groq_client():
     """Lazily build the GroqCloud client. Returns None when no key is configured."""
     global _groq_client
-    api_key = os.environ.get("GROQ_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    api_key = env_str("GROQ_API_KEY") or env_str("OPENAI_API_KEY")
     if not api_key:
         return None
     with _groq_lock:
