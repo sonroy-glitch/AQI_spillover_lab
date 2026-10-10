@@ -32,7 +32,6 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
-import pandas as pd
 import requests
 from flask import Flask, Response, jsonify, request, stream_with_context
 from flask_cors import CORS
@@ -73,6 +72,11 @@ MODEL_BASE_URL = os.environ.get("AQI_MODEL_BASE_URL", "").rstrip("/")
 USE_MODELS = os.environ.get("AQI_USE_MODELS", "1") != "0"
 WARM_MODELS = os.environ.get("AQI_WARM_MODELS", "1") != "0"   # preload at boot
 TREE_SAMPLE = int(os.environ.get("AQI_TREE_SAMPLE", "150"))   # trees polled for the band
+# Which horizons to load at all. model_24.pkl alone unpickles to ~500MB, so on a small
+# plan "6,12,18" keeps the other three and lets +24h fall back to Open-Meteo.
+ENABLED_HORIZONS = {
+    int(h) for h in os.environ.get("AQI_MODEL_HORIZONS", "6,12,18,24").split(",") if h.strip()
+}
 USE_OVERPASS = os.environ.get("AQI_USE_OVERPASS", "1") != "0"
 
 # Chat: the groq client appends "/openai/v1" itself, so GROQ_BASE_URL is the bare
@@ -196,7 +200,7 @@ def download_model(horizon: int, dest: str) -> None:
 
 def get_model(horizon: int):
     """Lazily unpickle models/model_<h>.pkl. Returns None if unavailable."""
-    if not USE_MODELS or horizon == 0:
+    if not USE_MODELS or horizon == 0 or horizon not in ENABLED_HORIZONS:
         return None
     with _model_lock:
         if horizon in _models:
@@ -260,6 +264,12 @@ def predict_horizon(horizon: int, feats: Dict[str, float]) -> Optional[Tuple[flo
     if model is None:
         return None
     try:
+        # pandas costs ~56MB resident and is only needed to label the feature
+        # columns, so it is imported here rather than at module scope — with
+        # AQI_USE_MODELS=0 the process never pays for it. (sklearn pulls pandas in
+        # itself, so this only saves memory when no model is loaded.)
+        import pandas as pd
+
         cols = list(getattr(model, "feature_names_in_", list(feats.keys())))
         X = pd.DataFrame([[feats.get(c, 0.0) for c in cols]], columns=cols)
         mean = float(model.predict(X)[0])
@@ -1234,15 +1244,36 @@ def chat():
     )
 
 
+def rss_mb() -> float:
+    """Resident memory of this process, for spotting an approaching OOM kill."""
+    try:
+        import resource
+
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # Linux reports kilobytes here, macOS bytes.
+        return peak / 1024 if os.uname().sysname == "Linux" else peak / 1048576
+    except Exception:
+        return -1.0
+
+
 def warm_models() -> None:
     def run():
         started = time.time()
-        for h in HORIZONS[1:]:
+        wanted = [h for h in HORIZONS[1:] if h in ENABLED_HORIZONS]
+        app.logger.info("warming models %s from %s (rss %.0fMB)",
+                        wanted, MODEL_DIR, rss_mb())
+        for h in wanted:
             get_model(h)
-        app.logger.info("model warmup finished in %.1fs", time.time() - started)
+            app.logger.info("model %sh ready, rss now %.0fMB", h, rss_mb())
+        app.logger.info("model warmup finished in %.1fs (rss %.0fMB)",
+                        time.time() - started, rss_mb())
 
     threading.Thread(target=run, daemon=True).start()
 
+
+app.logger.info("AeroCast backend starting: PORT=%s models=%s horizons=%s dir=%s",
+                os.environ.get("PORT", "8000"), USE_MODELS,
+                sorted(ENABLED_HORIZONS), MODEL_DIR)
 
 if USE_MODELS and WARM_MODELS:
     warm_models()

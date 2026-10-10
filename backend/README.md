@@ -124,6 +124,7 @@ the mock forecast generator is gone, so the backend is the single source of trut
 | `AQI_USE_MODELS` | `1` | `0` skips the models entirely (fast dev boot, Open-Meteo forecasts instead) |
 | `AQI_WARM_MODELS` | `1` | `0` loads models lazily on first use |
 | `AQI_TREE_SAMPLE` | `150` | Trees polled for the confidence band |
+| `AQI_MODEL_HORIZONS` | `6,12,18,24` | Which models to load; drop `24` to save 755MB |
 | `AQI_USE_OVERPASS` | `1` | `0` uses placeholder risk zones only |
 | `AQI_LOG_LEVEL` | `INFO` | Flask logger level |
 | `AQI_CACHE_TTL` | `600` | Seconds a city's forecast is cached |
@@ -203,14 +204,46 @@ WAQI_TOKEN     = <optional>        # secret, adds real ground stations
 
 ### Sizing
 
-Measured on this machine: the four forests occupy **~790MB resident** once loaded, plus
-~250MB for Python, Flask, pandas and sklearn — so about **1.1GB steady state**. A 1GB
-plan will OOM during warmup. Two ways to run smaller:
+Measured RSS as each model loads (`model <h>h ready, rss now …` in the logs):
 
-- `AQI_USE_MODELS=0` — skips the pickles entirely and falls back to Open-Meteo's own
-  AQI forecast for the +6/12/18/24h horizons. Comfortable in 512MB.
-- Keep the models but set `AQI_WARM_MODELS=0` so they load on first use rather than at
-  boot; the memory is the same once warm, just deferred.
+| after loading | RSS |
+| --- | --- |
+| baseline (Flask + sklearn + pandas) | 114 MB |
+| + `model_6` | 394 MB |
+| + `model_12` | 636 MB |
+| + `model_18` | 650 MB |
+| + `model_24` | **1405 MB** |
+
+So **all four need a 2GB plan**. `model_24.pkl` accounts for 755MB of that by itself —
+it is an unconstrained forest (`n_estimators=100`, no `max_depth`), unlike the other
+three. On a 1GB plan, drop it:
+
+```
+AQI_MODEL_HORIZONS=6,12,18
+```
+
++24h then falls back to Open-Meteo's own AQI forecast and everything else keeps using
+the trained models; `meta.modelByHorizon` shows exactly which is which. That config
+tops out around 650MB.
+
+Standalone footprints (idle RSS, measured):
+
+| config | RSS | fits in |
+| --- | --- | --- |
+| `AQI_USE_MODELS=0` | **59MB** (68MB serving) | 256MB |
+| `AQI_MODEL_HORIZONS=18` | 258MB | 512MB |
+| `AQI_MODEL_HORIZONS=6,12,18` | 653MB | 1GB |
+| all four (default) | 1405MB | 2GB |
+
+The jump from 59MB to 258MB for a single 32MB model is mostly scikit-learn and pandas
+being imported at all, not the forest itself. `pandas` is imported lazily (it costs
+56MB), so a models-off deployment never loads it.
+
+**On a 256MB container the models cannot be used** — even one of them exceeds the limit
+and the container is OOM-killed mid-warmup, which looks like a silent crashloop: clean
+gunicorn boot, no traceback, restart ~30s later with widening backoff. Run with
+`AQI_USE_MODELS=0` there; the dashboard is fully functional, with the +6/12/18/24h
+horizons coming from Open-Meteo's forecast instead of the trained forests.
 
 ### The models can't live in a plain git repo
 
